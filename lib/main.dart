@@ -3,6 +3,9 @@ import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_tts/flutter_tts.dart';
+import 'package:speech_to_text/speech_recognition_error.dart';
+import 'package:speech_to_text/speech_recognition_result.dart';
+import 'package:speech_to_text/speech_to_text.dart';
 
 void main() {
   runApp(const QuickSpeekApp());
@@ -60,9 +63,17 @@ const List<ReadingWord> readingWords = [
   ReadingWord(word: 'kupa', syllables: ['ku', 'pa'], imageFile: 'kupa.png'),
   ReadingWord(word: 'kawa', syllables: ['ka', 'wa'], imageFile: 'kawa.png'),
   ReadingWord(word: 'pepa', syllables: ['pe', 'pa'], imageFile: 'pepa.png'),
-  ReadingWord(word: 'spanie', syllables: ['spa', 'nie'], imageFile: 'spanie.png'),
+  ReadingWord(
+    word: 'spanie',
+    syllables: ['spa', 'nie'],
+    imageFile: 'spanie.png',
+  ),
   ReadingWord(word: 'krowa', syllables: ['kro', 'wa'], imageFile: 'krowa.png'),
-  ReadingWord(word: 'kaczka', syllables: ['kacz', 'ka'], imageFile: 'kaczka.png'),
+  ReadingWord(
+    word: 'kaczka',
+    syllables: ['kacz', 'ka'],
+    imageFile: 'kaczka.png',
+  ),
   ReadingWord(word: 'lama', syllables: ['la', 'ma'], imageFile: 'lama.png'),
 ];
 
@@ -75,16 +86,39 @@ class WordScreen extends StatefulWidget {
 
 class _WordScreenState extends State<WordScreen> {
   static const Duration _syllablePause = Duration(milliseconds: 400);
+  static const int _listenSeconds = 6;
+  static const Duration _listenDuration = Duration(seconds: _listenSeconds);
   static const String _voiceName = 'pl-PL-Standard-F';
+  static const List<Color> _pinkGradient = [
+    Color(0xFFFFF0F6),
+    Color(0xFFFFD6E7),
+    Color(0xFFF7C8E0),
+  ];
+  static const List<Color> _greenGradient = [
+    Color(0xFFE8F5E9),
+    Color(0xFFC8E6C9),
+    Color(0xFFA5D6A7),
+  ];
 
   final FlutterTts _tts = FlutterTts();
+  final SpeechToText _speech = SpeechToText();
   final Random _random = Random();
+  final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
 
   late int _currentIndex;
   late final Future<void> _speechReady;
   bool _speechError = false;
   int _speechGeneration = 0;
   int? _activeSyllableIndex;
+
+  Future<bool>? _recognitionInit;
+  int _listenGeneration = 0;
+  bool _isListening = false;
+  bool _sessionActive = false;
+  bool _wordCorrect = false;
+  String? _recognitionError;
+  Timer? _countdownTimer;
+  int _secondsLeft = 0;
 
   ReadingWord get _currentWord => readingWords[_currentIndex];
 
@@ -158,33 +192,344 @@ class _WordScreenState extends State<WordScreen> {
       nextIndex++;
     }
 
+    _listenGeneration++;
+    unawaited(_speech.stop());
+    _stopCountdown();
+
     setState(() {
       _currentIndex = nextIndex;
       _activeSyllableIndex = null;
+      _isListening = false;
+      _wordCorrect = false;
+      _recognitionError = null;
     });
 
     unawaited(_speakCurrentWord());
   }
 
+  void _repeatWord() {
+    _listenGeneration++;
+    unawaited(_speech.stop());
+    _stopCountdown();
+
+    setState(() {
+      _activeSyllableIndex = null;
+      _isListening = false;
+      _recognitionError = null;
+    });
+
+    unawaited(_speakCurrentWord());
+  }
+
+  Future<void> _startListening() async {
+    if (_isListening) return;
+
+    final generation = ++_listenGeneration;
+    _speechGeneration++;
+    await _tts.stop();
+    if (!mounted || generation != _listenGeneration) return;
+
+    setState(() {
+      _isListening = true;
+      _wordCorrect = false;
+      _recognitionError = null;
+      _activeSyllableIndex = null;
+    });
+    _sessionActive = true;
+    _startCountdown();
+
+    try {
+      _recognitionInit ??= _speech.initialize(
+        onStatus: _onRecognitionStatus,
+        onError: _onRecognitionError,
+      );
+      final available = await _recognitionInit!;
+      if (!mounted || generation != _listenGeneration) return;
+      if (!available) {
+        _recognitionInit = null;
+        _stopCountdown();
+        setState(() {
+          _isListening = false;
+          _recognitionError =
+              'Rozpoznawanie mowy jest niedostępne na tym telefonie.';
+        });
+        return;
+      }
+
+      await _beginListen(generation);
+    } on Exception {
+      if (!mounted || generation != _listenGeneration) return;
+      _stopCountdown();
+      setState(() {
+        _isListening = false;
+        _recognitionError = 'Nie udało się uruchomić nagrywania.';
+      });
+    }
+  }
+
+  Future<void> _beginListen(int generation) async {
+    if (!mounted || generation != _listenGeneration) return;
+    try {
+      await _speech.listen(
+        onResult: (result) => _onRecognitionResult(result, generation),
+        listenOptions: SpeechListenOptions(
+          localeId: 'pl_PL',
+          listenFor: _listenDuration,
+          partialResults: true,
+          cancelOnError: true,
+        ),
+      );
+    } on Exception {
+      return;
+    }
+  }
+
+  void _onRecognitionResult(SpeechRecognitionResult result, int generation) {
+    if (!mounted || generation != _listenGeneration) return;
+    final target = _normalize(_currentWord.word);
+    final heard = _normalize(result.recognizedWords);
+    final matches =
+        target.isNotEmpty && (heard == target || heard.contains(target));
+    if (!matches) return;
+
+    _stopCountdown();
+    unawaited(_speech.stop());
+    setState(() {
+      _wordCorrect = true;
+      _isListening = false;
+    });
+  }
+
+  void _onRecognitionStatus(String status) {
+    if (!mounted) return;
+    if (status != 'done' && status != 'notListening') return;
+
+    if (_wordCorrect) {
+      _stopCountdown();
+      if (_isListening) {
+        setState(() => _isListening = false);
+      }
+      return;
+    }
+    if (!_sessionActive) return;
+
+    final generation = _listenGeneration;
+    if (_secondsLeft > 0) {
+      unawaited(_beginListen(generation));
+    } else {
+      _finishSession();
+    }
+  }
+
+  void _onRecognitionError(SpeechRecognitionError error) {
+    if (!mounted || _wordCorrect) return;
+    const noMatchErrors = {'error_no_match', 'error_speech_timeout'};
+    final noMatch = noMatchErrors.contains(error.errorMsg);
+
+    if (noMatch) {
+      if (!_sessionActive) return;
+      final generation = _listenGeneration;
+      if (_secondsLeft > 0) {
+        unawaited(_beginListen(generation));
+      } else {
+        _finishSession();
+      }
+      return;
+    }
+
+    _stopCountdown();
+    setState(() {
+      _isListening = false;
+      _recognitionError =
+          'Spróbuj ponownie.';
+    });
+  }
+
+  void _startCountdown() {
+    _countdownTimer?.cancel();
+    setState(() => _secondsLeft = _listenSeconds);
+    _countdownTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted) {
+        timer.cancel();
+        return;
+      }
+      if (_secondsLeft <= 1) {
+        _finishSession();
+      } else {
+        setState(() => _secondsLeft--);
+      }
+    });
+  }
+
+  void _finishSession() {
+    _stopCountdown();
+    _listenGeneration++;
+    unawaited(_speech.stop());
+    if (!mounted) return;
+    setState(() {
+      _isListening = false;
+      if (!_wordCorrect && _recognitionError == null) {
+        _recognitionError = 'Spróbuj ponownie';
+      }
+    });
+  }
+
+  void _stopCountdown() {
+    _countdownTimer?.cancel();
+    _countdownTimer = null;
+    _secondsLeft = 0;
+    _sessionActive = false;
+  }
+
+  void _selectWord(ReadingWord word) {
+    Navigator.of(context).pop();
+    final index = readingWords.indexOf(word);
+    if (index < 0) return;
+
+    _listenGeneration++;
+    unawaited(_speech.stop());
+    _stopCountdown();
+
+    setState(() {
+      _currentIndex = index;
+      _activeSyllableIndex = null;
+      _isListening = false;
+      _wordCorrect = false;
+      _recognitionError = null;
+    });
+
+    unawaited(_speakCurrentWord());
+  }
+
+  Widget _buildDrawer() {
+    final sortedWords = [...readingWords]
+      ..sort((a, b) => _normalize(a.word).compareTo(_normalize(b.word)));
+
+    return Drawer(
+      child: SafeArea(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 20, 20, 14),
+              child: Row(
+                children: [
+                  const Icon(
+                    Icons.menu_book_rounded,
+                    color: Color(0xFFEF6C00),
+                    size: 28,
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      'Wybierz słowo',
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 20,
+                        fontWeight: FontWeight.w800,
+                        color: Colors.brown.shade800,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const Divider(height: 1),
+            Expanded(
+              child: ListView.builder(
+                itemCount: sortedWords.length,
+                itemBuilder: (context, i) {
+                  final word = sortedWords[i];
+                  final selected = word == _currentWord;
+                  return ListTile(
+                    title: Text(
+                      word.word,
+                      style: TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.w700,
+                        color: Colors.brown.shade800,
+                      ),
+                    ),
+                    subtitle: Text(
+                      word.syllables.join('-'),
+                      style: TextStyle(color: Colors.brown.shade400),
+                    ),
+                    selected: selected,
+                    selectedTileColor: const Color(
+                      0xFFC8E6C9,
+                    ).withValues(alpha: 0.6),
+                    trailing: selected
+                        ? const Icon(
+                            Icons.check_rounded,
+                            color: Color(0xFF1B5E20),
+                          )
+                        : null,
+                    onTap: () => _selectWord(word),
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  String _normalize(String value) {
+    const from = 'ąćęłńóśźż';
+    const to = 'acelnoszz';
+    final buffer = StringBuffer();
+    for (final char in value.toLowerCase().split('')) {
+      final index = from.indexOf(char);
+      if (index >= 0) {
+        buffer.write(to[index]);
+      } else {
+        final code = char.codeUnitAt(0);
+        if (code >= 97 && code <= 122) {
+          buffer.write(char);
+        }
+      }
+    }
+    return buffer.toString();
+  }
+
+  String get _statusText {
+    if (_wordCorrect) return 'Brawo! Przeczytałeś poprawnie!';
+    if (_isListening) {
+      return 'Słucham... powiedz: ${_currentWord.word} ($_secondsLeft s)';
+    }
+    if (_recognitionError != null) return _recognitionError!;
+    if (_speechError) {
+      return 'Nie udało się włączyć mowy. Sprawdź głos w ustawieniach telefonu.';
+    }
+    return 'Dotknij ekranu, aby zobaczyć kolejne słowo';
+  }
+
   @override
   void dispose() {
     _speechGeneration++;
+    _listenGeneration++;
+    _countdownTimer?.cancel();
     _tts.stop();
+    _speech.cancel();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      key: _scaffoldKey,
+      drawer: _buildDrawer(),
       body: GestureDetector(
         behavior: HitTestBehavior.opaque,
         onTap: _showNextWord,
-        child: Container(
-          decoration: const BoxDecoration(
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 400),
+          decoration: BoxDecoration(
             gradient: LinearGradient(
               begin: Alignment.topLeft,
               end: Alignment.bottomRight,
-              colors: [Color(0xFFFFF0F6), Color(0xFFFFD6E7), Color(0xFFF7C8E0)],
+              colors: _wordCorrect ? _greenGradient : _pinkGradient,
             ),
           ),
           child: SafeArea(
@@ -192,7 +537,11 @@ class _WordScreenState extends State<WordScreen> {
               padding: const EdgeInsets.fromLTRB(24, 16, 24, 24),
               child: Column(
                 children: [
-                  const _Header(),
+                  _Header(
+                    isListening: _isListening,
+                    onListen: _startListening,
+                    onMenu: () => _scaffoldKey.currentState?.openDrawer(),
+                  ),
                   const SizedBox(height: 16),
                   Expanded(
                     child: Center(
@@ -205,21 +554,39 @@ class _WordScreenState extends State<WordScreen> {
                       ),
                     ),
                   ),
-                  const SizedBox(height: 20),
+                  const SizedBox(height: 16),
+                  Material(
+                    color: Colors.white.withValues(alpha: 0.9),
+                    shape: const CircleBorder(),
+                    elevation: 3,
+                    child: IconButton(
+                      onPressed: _repeatWord,
+                      icon: const Icon(Icons.volume_up_rounded),
+                      iconSize: 40,
+                      color: const Color(0xFFEF6C00),
+                      tooltip: 'Powtórz słowo',
+                      padding: const EdgeInsets.all(16),
+                      constraints: const BoxConstraints(
+                        minWidth: 72,
+                        minHeight: 72,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
                   _SyllableCard(
                     word: _currentWord,
                     activeSyllableIndex: _activeSyllableIndex,
                   ),
                   const SizedBox(height: 18),
                   Text(
-                    _speechError
-                        ? 'Nie udało się włączyć mowy. Sprawdź głos w ustawieniach telefonu.'
-                        : 'Dotknij ekranu, aby zobaczyć kolejne słowo',
+                    _statusText,
                     textAlign: TextAlign.center,
                     style: TextStyle(
                       fontSize: 16,
                       fontWeight: FontWeight.w600,
-                      color: Colors.brown.shade700,
+                      color: _wordCorrect
+                          ? const Color(0xFF1B5E20)
+                          : Colors.brown.shade700,
                     ),
                   ),
                 ],
@@ -233,39 +600,58 @@ class _WordScreenState extends State<WordScreen> {
 }
 
 class _Header extends StatelessWidget {
-  const _Header();
+  const _Header({
+    required this.isListening,
+    required this.onListen,
+    required this.onMenu,
+  });
+
+  final bool isListening;
+  final VoidCallback onListen;
+  final VoidCallback onMenu;
 
   @override
   Widget build(BuildContext context) {
     return Row(
       children: [
-        const Icon(
-          Icons.record_voice_over_rounded,
-          color: Color(0xFFEF6C00),
-          size: 34,
-        ),
-        const SizedBox(width: 10),
-        Text(
-          'Quick Speek',
-          style: TextStyle(
-            fontSize: 24,
-            fontWeight: FontWeight.w800,
-            color: Colors.brown.shade800,
-          ),
+        IconButton(
+          onPressed: onMenu,
+          icon: const Icon(Icons.menu_rounded),
+          color: Colors.brown.shade800,
+          tooltip: 'Wybierz słowo',
+          visualDensity: VisualDensity.compact,
+          padding: EdgeInsets.zero,
         ),
         const Spacer(),
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-          decoration: BoxDecoration(
-            color: Colors.white.withValues(alpha: 0.75),
-            borderRadius: BorderRadius.circular(20),
-          ),
-          child: Text(
-            'czytamy razem',
-            style: TextStyle(
-              fontSize: 13,
-              fontWeight: FontWeight.w700,
-              color: Colors.brown.shade600,
+        Material(
+          color: isListening
+              ? const Color(0xFFC8E6C9)
+              : Colors.white.withValues(alpha: 0.75),
+          borderRadius: BorderRadius.circular(26),
+          child: InkWell(
+            borderRadius: BorderRadius.circular(26),
+            onTap: onListen,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    isListening ? Icons.graphic_eq_rounded : Icons.mic_rounded,
+                    size: 24,
+                    color: Colors.brown.shade600,
+                  ),
+                  const SizedBox(width: 10),
+                  Text(
+                    'czytamy razem',
+                    style: TextStyle(
+                      fontSize: 17,
+                      fontWeight: FontWeight.w700,
+                      color: Colors.brown.shade600,
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
         ),
