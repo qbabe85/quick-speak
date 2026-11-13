@@ -86,7 +86,7 @@ class WordScreen extends StatefulWidget {
 
 class _WordScreenState extends State<WordScreen> {
   static const Duration _syllablePause = Duration(milliseconds: 400);
-  static const int _listenSeconds = 6;
+  static const int _listenSeconds = 5;
   static const Duration _listenDuration = Duration(seconds: _listenSeconds);
   static const String _voiceName = 'pl-PL-Standard-F';
   static const List<Color> _pinkGradient = [
@@ -108,6 +108,7 @@ class _WordScreenState extends State<WordScreen> {
   late int _currentIndex;
   late final Future<void> _speechReady;
   bool _speechError = false;
+  bool _voiceReady = false;
   int _speechGeneration = 0;
   int? _activeSyllableIndex;
 
@@ -117,6 +118,7 @@ class _WordScreenState extends State<WordScreen> {
   bool _sessionActive = false;
   bool _wordCorrect = false;
   String? _recognitionError;
+  String _committedText = '';
   Timer? _countdownTimer;
   int _secondsLeft = 0;
 
@@ -138,15 +140,39 @@ class _WordScreenState extends State<WordScreen> {
 
   Future<void> _configureSpeech() async {
     try {
-      await _tts.setLanguage('pl-PL');
       await _tts.awaitSpeakCompletion(true);
       await _tts.setSpeechRate(0.35);
       await _tts.setPitch(1.0);
       await _tts.setVolume(1.0);
-      await _tts.setVoice({'name': _voiceName, 'locale': 'pl-PL'});
+      await _ensurePolishVoice();
     } on Exception {
       if (!mounted) return;
       setState(() => _speechError = true);
+    }
+  }
+
+  Future<bool> _applyPolishVoice() async {
+    try {
+      final language = await _tts.setLanguage('pl-PL');
+      final voice = await _tts.setVoice({
+        'name': _voiceName,
+        'locale': 'pl-PL',
+      });
+      return (language == 1 || language == true) &&
+          (voice == 1 || voice == true);
+    } on Exception {
+      return false;
+    }
+  }
+
+  Future<void> _ensurePolishVoice() async {
+    if (_voiceReady) return;
+    for (var attempt = 0; attempt < 20; attempt++) {
+      if (await _applyPolishVoice()) {
+        _voiceReady = true;
+        return;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 250));
     }
   }
 
@@ -155,6 +181,10 @@ class _WordScreenState extends State<WordScreen> {
     final word = _currentWord;
     await _speechReady;
     if (!mounted || generation != _speechGeneration) return;
+    if (!_voiceReady) {
+      _voiceReady = await _applyPolishVoice();
+      if (!mounted || generation != _speechGeneration) return;
+    }
 
     try {
       await _tts.stop();
@@ -236,6 +266,7 @@ class _WordScreenState extends State<WordScreen> {
       _activeSyllableIndex = null;
     });
     _sessionActive = true;
+    _committedText = '';
     _startCountdown();
 
     try {
@@ -286,11 +317,16 @@ class _WordScreenState extends State<WordScreen> {
 
   void _onRecognitionResult(SpeechRecognitionResult result, int generation) {
     if (!mounted || generation != _listenGeneration) return;
-    final target = _normalize(_currentWord.word);
-    final heard = _normalize(result.recognizedWords);
-    final matches =
-        target.isNotEmpty && (heard == target || heard.contains(target));
-    if (!matches) return;
+
+    final utterance = result.recognizedWords;
+    final combined = _committedText.isEmpty
+        ? utterance
+        : '$_committedText $utterance';
+    if (result.finalResult) {
+      _committedText = combined;
+    }
+
+    if (!_matchesWord(_normalize(combined))) return;
 
     _stopCountdown();
     unawaited(_speech.stop());
@@ -298,6 +334,23 @@ class _WordScreenState extends State<WordScreen> {
       _wordCorrect = true;
       _isListening = false;
     });
+  }
+
+  bool _matchesWord(String heard) {
+    if (heard.isEmpty) return false;
+    final target = _normalize(_currentWord.word);
+    if (target.isEmpty) return false;
+    if (heard.contains(target)) return true;
+
+    var searchFrom = 0;
+    for (final syllable in _currentWord.syllables) {
+      final part = _normalize(syllable);
+      if (part.isEmpty) continue;
+      final index = heard.indexOf(part, searchFrom);
+      if (index < 0) return false;
+      searchFrom = index + part.length;
+    }
+    return true;
   }
 
   void _onRecognitionStatus(String status) {
@@ -340,8 +393,7 @@ class _WordScreenState extends State<WordScreen> {
     _stopCountdown();
     setState(() {
       _isListening = false;
-      _recognitionError =
-          'Spróbuj ponownie.';
+      _recognitionError = 'Spróbuj ponownie.';
     });
   }
 
@@ -379,6 +431,7 @@ class _WordScreenState extends State<WordScreen> {
     _countdownTimer = null;
     _secondsLeft = 0;
     _sessionActive = false;
+    _committedText = '';
   }
 
   void _selectWord(ReadingWord word) {
